@@ -1,154 +1,242 @@
-// 拦截所有头像图片的缩略图请求，重定向到原图
-// 同时将 .gif / .mp4 文件正确处理：GIF 保持 img 但去模糊，MP4 转换为 video 标签
+/**
+ * SillyTavern Avatar Deblur + GIF/MP4 Support
+ * ------------------------------------------------------------
+ * 1. 拦截 /thumbnail?type=xxx&file=yyy 请求，重写为直接指向原图的路径（原功能）
+ * 2. 额外处理 GIF：强制刷新 src 使动画生效
+ * 3. 额外处理 MP4/WebM：将 <img> 替换为 <video> 并循环播放
+ */
 
-(function() {
-    // 防止重复加载
-    if (window._avatarDeblurEnhancedLoaded) return;
-    window._avatarDeblurEnhancedLoaded = true;
+(function () {
+    'use strict';
 
-    const ST = SillyTavern.getContext();  // 获取 SillyTavern 上下文
+    const TAG = '[Avatar Deblur+Media]';
 
-    // 检测是否为缩略图路径，并转换为原图 URL
-    function getOriginalUrl(url) {
-        if (!url) return url;
-        // 常见缩略图模式：/thumb/xxx 或包含 'thumbnail'
-        let newUrl = url;
-        newUrl = newUrl.replace(/\/thumb\//g, '/');
-        newUrl = newUrl.replace(/thumbnail/gi, '');
-        // 去除可能残留的尺寸参数 (如 ?height=100)
-        newUrl = newUrl.replace(/\?.*$/, '');
-        // 如果去缩略图后路径与原图不同，返回新路径
-        if (newUrl !== url) return newUrl;
-        return url;
-    }
+    // thumbnail type -> 真实资料夹
+    const TYPE_MAP = {
+        avatar: 'characters',
+        bg: 'backgrounds',
+        persona: 'User Avatars',
+    };
 
-    // 判断文件类型
-    function getMediaType(url) {
-        const ext = (url.split('?')[0].split('.').pop() || '').toLowerCase();
-        if (ext === 'mp4' || ext === 'webm' || ext === 'mov') return 'video';
-        if (ext === 'gif') return 'gif';
-        return 'image';
-    }
+    // 支持的视频格式（可根据需要添加）
+    const VIDEO_EXTS = ['mp4', 'webm', 'mov'];
 
-    // 处理单个头像元素 (img 标签)
-    function processAvatarElement(img) {
-        if (!img || img._avatarProcessed) return;
-        img._avatarProcessed = true;
+    /**
+     * 把 /thumbnail?type=...&file=... 改写成直链
+     */
+    function rewriteUrl(url) {
+        try {
+            if (!url || typeof url !== 'string') return url;
+            if (url.indexOf('/thumbnail') === -1) return url;
 
-        const originalSrc = img.src;
-        if (!originalSrc) return;
+            const u = new URL(url, window.location.origin);
+            if (!u.pathname.endsWith('/thumbnail')) return url;
 
-        const originalUrl = getOriginalUrl(originalSrc);
-        const mediaType = getMediaType(originalUrl);
+            const type = u.searchParams.get('type');
+            const file = u.searchParams.get('file');
+            if (!type || !file) return url;
 
-        // 如果是普通图片或 GIF，直接修改 img 的 src 即可（GIF 会动画）
-        if (mediaType === 'image' || mediaType === 'gif') {
-            if (originalUrl !== originalSrc) {
-                img.src = originalUrl;
-            }
-            return;
-        }
+            const folder = TYPE_MAP[type];
+            if (!folder) return url;
 
-        // 如果是视频文件（mp4 等），将 img 替换为 video 标签
-        if (mediaType === 'video') {
-            const video = document.createElement('video');
-            // 复制所有有用的属性
-            video.src = originalUrl;
-            video.autoplay = true;
-            video.loop = true;
-            video.muted = true;      // 自动播放必须静音
-            video.playsInline = true;
-            video.controls = false;   // 头像通常不需要控制条
-            // 复制 class、id、style 等
-            video.className = img.className;
-            video.id = img.id;
-            video.style.cssText = img.style.cssText;
-            // 复制宽度/高度
-            if (img.width) video.width = img.width;
-            if (img.height) video.height = img.height;
-            // 复制 data-* 属性
-            for (const attr of img.attributes) {
-                if (attr.name.startsWith('data-')) {
-                    video.setAttribute(attr.name, attr.value);
-                }
-            }
-            // 替换节点
-            img.parentNode.replaceChild(video, img);
-            // 尝试播放（某些浏览器需要用户交互，但静音自动播放多数支持）
-            video.play().catch(e => console.debug('Autoplay blocked:', e));
-            return;
+            // 注意：file 已经是 encodeURIComponent 过的，直接拼
+            return `/${encodeURIComponent(folder)}/${file}`;
+        } catch (e) {
+            return url;
         }
     }
 
-    // 扫描整个 DOM，处理所有头像相关元素
-    function scanAndProcess() {
-        // 选择器覆盖常见的头像/角色图像/背景
-        const selectors = [
-            'img.avatar',           // 常见类名
-            'img.character_image',
-            'img[class*="avatar"]',
-            'img[class*="character"]',
-            '.chara-thumb img',     // 角色选择栏
-            '.mes_avatar img',      // 消息头像
-            '.persona-avatar img',
-            '[data-avatar] img',
-            '.avatar_image img',
-            '.sprite-image',        // 不确定，但涵盖
-            'img[src*="characters"]' // 任何包含 characters 路径的图片
-        ];
-        const elements = document.querySelectorAll(selectors.join(','));
-        elements.forEach(el => {
-            if (el.tagName === 'IMG') processAvatarElement(el);
-            // 如果选择器选中的不是 img，再找内部的 img
-            if (el.querySelectorAll) {
-                el.querySelectorAll('img').forEach(img => processAvatarElement(img));
-            }
+    /**
+     * 从 CSS background-image 值里抽 url(...) 并改写
+     */
+    function rewriteBackgroundImage(value) {
+        if (!value || value.indexOf('/thumbnail') === -1) return value;
+        return value.replace(/url\((['"]?)([^'")]+)\1\)/g, (match, quote, raw) => {
+            const nu = rewriteUrl(raw);
+            return `url(${quote}${nu}${quote})`;
         });
     }
 
-    // 监听动态添加的新元素
-    let observer;
-    function startObserver() {
-        if (observer) observer.disconnect();
-        observer = new MutationObserver(mutations => {
-            let needScan = false;
-            for (const mut of mutations) {
-                if (mut.addedNodes.length) {
-                    needScan = true;
-                    break;
+    // -----------------------------------------------------
+    // 新增：判断文件是否为视频
+    function isVideoUrl(url) {
+        if (!url) return false;
+        const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+        return VIDEO_EXTS.includes(ext);
+    }
+
+    // 新增：判断是否为 GIF
+    function isGifUrl(url) {
+        if (!url) return false;
+        const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+        return ext === 'gif';
+    }
+
+    // 新增：强制刷新 GIF
+    function refreshGif(img, newSrc) {
+        if (!img || img.tagName !== 'IMG') return;
+        // 如果 src 没变，也要重新加载一次（清除缓存）
+        if (img.src === newSrc) {
+            // 简单方法：加一个随机参数强制刷新
+            const separator = newSrc.includes('?') ? '&' : '?';
+            img.src = newSrc + separator + '_t=' + Date.now();
+        } else {
+            img.src = newSrc;
+        }
+        // 可选：把图片的 loading="lazy" 临时去掉，确保立即加载
+        img.loading = 'eager';
+    }
+
+    // 新增：将 img 替换为 video
+    function replaceImgWithVideo(img, videoSrc) {
+        if (!img || img.tagName !== 'IMG') return;
+        // 防止重复替换（原 img 可能已被替换过一次）
+        if (img._replacedAsVideo) return;
+
+        const video = document.createElement('video');
+        // 复制所有重要的属性
+        video.src = videoSrc;
+        video.autoplay = true;
+        video.loop = true;
+        video.muted = true;          // 自动播放必须静音
+        video.playsInline = true;    // iOS 内联播放
+        video.controls = false;
+        // 复制 class、id、样式
+        video.className = img.className;
+        video.id = img.id;
+        if (img.style.cssText) video.style.cssText = img.style.cssText;
+        // 复制宽度/高度属性
+        if (img.width) video.width = img.width;
+        if (img.height) video.height = img.height;
+        // 复制 data-* 属性
+        for (const attr of img.attributes) {
+            if (attr.name.startsWith('data-')) {
+                video.setAttribute(attr.name, attr.value);
+            }
+        }
+        // 标记已替换，避免重复操作
+        video._isVideoReplacement = true;
+        img._replacedAsVideo = true;
+
+        // 替换节点
+        img.parentNode.replaceChild(video, img);
+
+        // 尝试播放（静音自动播放大部分浏览器允许）
+        video.play().catch(e => console.debug(`${TAG} Autoplay blocked:`, e));
+    }
+
+    // -----------------------------------------------------
+    // 处理单个 img (主要修改点)
+    function processImg(img) {
+        if (!img || img.tagName !== 'IMG') return;
+        // 如果这个img已经被替换成video，不再处理
+        if (img._replacedAsVideo) return;
+
+        const src = img.getAttribute('src');
+        if (!src) return;
+
+        const newSrc = rewriteUrl(src);
+        if (newSrc === src && !isGifUrl(src) && !isVideoUrl(src)) return;
+
+        // 情况1：视频文件 -> 替换标签
+        if (isVideoUrl(newSrc)) {
+            replaceImgWithVideo(img, newSrc);
+            return;
+        }
+
+        // 情况2：GIF 文件 -> 强制刷新，确保动起来
+        if (isGifUrl(newSrc)) {
+            refreshGif(img, newSrc);
+            return;
+        }
+
+        // 情况3：普通图片（包括原插件功能）
+        if (newSrc !== src) {
+            img.setAttribute('src', newSrc);
+        }
+    }
+
+    function processBg(el) {
+        if (!el.style) return;
+        const bg = el.style.backgroundImage;
+        if (!bg) return;
+        const nb = rewriteBackgroundImage(bg);
+        if (nb !== bg) el.style.backgroundImage = nb;
+    }
+
+    function processElement(el) {
+        if (!el || el.nodeType !== 1) return;
+        // 处理 img 标签
+        if (el.tagName === 'IMG') {
+            processImg(el);
+        }
+        // 处理背景图片
+        processBg(el);
+
+        // 如果元素内有 img（例如容器内）
+        if (el.querySelectorAll) {
+            el.querySelectorAll('img').forEach(processImg);
+            el.querySelectorAll('[style*="thumbnail"]').forEach(processBg);
+        }
+    }
+
+    // 初始扫描整个文档
+    function initialSweep() {
+        document.querySelectorAll('img').forEach(processImg);
+        document.querySelectorAll('[style*="thumbnail"]').forEach(processBg);
+    }
+
+    // --- MutationObserver 监听动态变化 ---
+    const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            if (m.type === 'childList') {
+                m.addedNodes.forEach((node) => {
+                    if (node.nodeType === 1) processElement(node);
+                });
+            } else if (m.type === 'attributes') {
+                const t = m.target;
+                if (m.attributeName === 'src' && t.tagName === 'IMG') {
+                    // 避免对已经替换成 video 的旧元素重复处理（实际上已替换后不再是 img）
+                    processImg(t);
+                } else if (m.attributeName === 'style') {
+                    processBg(t);
                 }
-                // 属性变化也可能是头像 src 更新
-                if (mut.type === 'attributes' && mut.attributeName === 'src') {
-                    const target = mut.target;
-                    if (target.tagName === 'IMG') {
-                        // 重新处理该 img（因为 src 变了，可能变成新的缩略图）
-                        target._avatarProcessed = false;
-                        processAvatarElement(target);
+            }
+        }
+    });
+
+    // 拦截 fetch 作为保险（保持原功能）
+    const origFetch = window.fetch;
+    if (typeof origFetch === 'function') {
+        window.fetch = function (input, init) {
+            try {
+                if (typeof input === 'string') {
+                    input = rewriteUrl(input);
+                } else if (input && input.url) {
+                    const nu = rewriteUrl(input.url);
+                    if (nu !== input.url) {
+                        input = new Request(nu, input);
                     }
                 }
-            }
-            if (needScan) scanAndProcess();
-        });
-        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+            } catch (e) { /* noop */ }
+            return origFetch.call(this, input, init);
+        };
     }
 
-    // 当 SillyTavern 界面完全加载后启动
-    function init() {
-        scanAndProcess();
-        startObserver();
-        // 监听角色切换事件（SillyTavern 的自定义事件）
-        window.addEventListener('sillytavern:character-selected', () => {
-            // 延迟一点让 DOM 更新
-            setTimeout(scanAndProcess, 200);
+    function start() {
+        initialSweep();
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src', 'style'],
         });
-        // 也可以监听消息发送等事件
-        window.addEventListener('sillytavern:message-sent', () => setTimeout(scanAndProcess, 100));
+        console.log(`${TAG} loaded — supports GIF animation & MP4 video avatars`);
     }
 
-    // 等待 DOM 和 SillyTavern 上下文就绪
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', start, { once: true });
     } else {
-        init();
+        start();
     }
 })();
