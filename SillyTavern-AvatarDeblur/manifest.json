@@ -1,0 +1,10 @@
+{
+    "display_name": "Avatar Deblur + GIF/MP4 Support",
+    "description": "自动修复头像模糊，并支持 GIF 动图和 MP4 视频头像",
+    "author": "Based on ZZZa-o's work, enhanced by you",
+    "version": "1.1.0",
+    "license": "MIT",
+    "type": "extension",
+    "module": "main.js",
+    "css": "style.css"
+}
